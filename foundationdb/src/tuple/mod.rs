@@ -8,16 +8,18 @@
 
 //! Tuple Key type like that of other FoundationDB libraries
 
-mod element;
-
 use std::ops::{Deref, DerefMut};
 use std::{self, io::Write, string::FromUtf8Error};
 
 #[cfg(feature = "uuid")]
 use uuid;
 
+use tuple::Error::TooManyIncompleteVersionstamps;
+
 pub use self::element::Element;
 use self::element::Type;
+
+mod element;
 
 /// Tuple encoding/decoding related errors
 #[derive(Debug, Fail)]
@@ -41,25 +43,54 @@ pub enum Error {
     #[cfg(feature = "uuid")]
     #[fail(display = "UUID conversion error")]
     FromUuidError(uuid::BytesError),
+    /// IO Conversion error for tuple data
+    #[fail(display = "IO error")]
+    FromIoError(std::io::Error),
+    /// Tuple can only be backed with at most one incomplete versionstamp
+    #[fail(display = "cannot pack tuple with more than one incomplete versionstamp")]
+    TooManyIncompleteVersionstamps,
+    /// Tuples are written with pack and pack_with_versionstamp, only the latter can handle incomplete versionstamps
+    #[fail(display = "cannot encode tuple with incomplete versionstamp using vanilla pack")]
+    UnexpectedIncompleteVersionstamp,
+    /// pack_with_versionstamp could not find incomplete versionstamp
+    #[fail(display = "tuple did not contain an incomplete versionstamp")]
+    ExpectedIncompleteVersionstamp,
+}
+
+/// Tracks whether Tuple encode/decode chain has seen an incomplete tuple so far
+#[derive(Copy, Clone)]
+enum SeenIncompleteVersionstamp {
+    YES,
+    NO,
 }
 
 /// Tracks the depth of a Tuple decoding chain
 #[derive(Copy, Clone)]
-pub struct TupleDepth(usize);
+pub struct TupleDepth(usize, bool);
 
 impl TupleDepth {
     fn new() -> Self {
-        TupleDepth(0)
+        TupleDepth(0, false)
     }
 
     /// Increment the depth by one, this be called when calling into `Tuple::{encode, decode}` of tuple-like datastructures
     pub fn increment(&self) -> Self {
-        TupleDepth(self.0 + 1)
+        TupleDepth(self.0 + 1, self.1)
+    }
+
+    /// Marks versionstamp
+    pub fn mark_incomplete_versionstamp(&self) -> Self {
+        TupleDepth(self.0, true)
     }
 
     /// Returns the current depth in any recursive tuple processing, 0 representing there having been no recursion
     pub fn depth(&self) -> usize {
         self.0
+    }
+
+    /// marks things
+    pub fn seen_incomplete_versionstamp(&self) -> bool {
+        self.1
     }
 }
 
@@ -98,19 +129,27 @@ pub trait Encode {
     ///
     /// * `w` - a Write to put the self as FoundationDB encoded bytes
     /// * `tuple_depth` - the current depth in recursive tuple-like datastructures, it should be incremented only when encoding a tuple inside another object, see `encode_to` for a method which can initialize the TupleDepth.
-    fn encode<W: Write>(&self, w: &mut W, tuple_depth: TupleDepth) -> std::io::Result<()>;
+    fn encode<W: Write>(&self, w: &mut W, tuple_depth: TupleDepth) -> Result<()>;
 
     /// Encodes this tuple/element into the associated Write
     ///
     /// # Arguments
     ///
     /// * `w` - a Write to put the self as FoundationDB encoded bytes
-    fn encode_to<W: Write>(&self, w: &mut W) -> std::io::Result<()> {
+    fn encode_to<W: Write>(&self, w: &mut W) -> Result<()> {
         self.encode(w, TupleDepth::new())
     }
 
     /// Encodes this tuple/element into a new Vec
     fn to_vec(&self) -> Vec<u8> {
+        let mut v = Vec::new();
+        self.encode_to(&mut v)
+            .expect("tuple encoding should never fail");
+        v
+    }
+
+    /// Encodes this tuple/element into a new Vec
+    fn to_vec_with_versionstamp(&self) -> Vec<u8> {
         let mut v = Vec::new();
         self.encode_to(&mut v)
             .expect("tuple encoding should never fail");
@@ -163,7 +202,7 @@ macro_rules! tuple_impls {
                 $($name: Encode,)+
             {
                 #[allow(non_snake_case, unused_assignments, deprecated)]
-                fn encode<W: Write>(&self, w: &mut W, tuple_depth: TupleDepth) -> std::io::Result<()> {
+                fn encode<W: Write>(&self, w: &mut W, tuple_depth: TupleDepth) -> Result<()> {
                     if tuple_depth.depth() > 0 {
                         element::NESTED.write(w)?;
                     }
@@ -237,10 +276,19 @@ tuple_impls! {
 }
 
 impl Encode for Tuple {
-    fn encode<W: Write>(&self, w: &mut W, tuple_depth: TupleDepth) -> std::io::Result<()> {
+    fn encode<W: Write>(&self, w: &mut W, tuple_depth: TupleDepth) -> Result<()> {
+        if tuple_depth.depth() == 0 {
+            let num_incomplete_versionstamps = self.count_incomplete_versionstamps(0);
+
+            if num_incomplete_versionstamps > 0 {
+                return Err(Error::TooManyIncompleteVersionstamps);
+            }
+        }
+
         for element in self.0.iter() {
             element.encode(w, tuple_depth.increment())?;
         }
+
         Ok(())
     }
 }
@@ -273,8 +321,39 @@ impl From<uuid::BytesError> for Error {
     }
 }
 
+impl From<std::io::Error> for Error {
+    fn from(error: std::io::Error) -> Self {
+        Error::FromIoError(error)
+    }
+}
+
+impl Tuple {
+    fn count_incomplete_versionstamps(&self, incomplete_versionstamps: usize) -> usize {
+        let mut additional_versionstamps = 0;
+
+        for element in self.0.iter() {
+            match element {
+                Element::Tuple(inner) => {
+                    additional_versionstamps +=
+                        Tuple::count_incomplete_versionstamps(inner, incomplete_versionstamps + 1);
+                }
+                Element::Versionstamp(v) => {
+                    if v.is_complete() {
+                        additional_versionstamps += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        additional_versionstamps
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use tuple::element::Versionstamp;
+
     use super::*;
 
     #[test]
@@ -351,7 +430,8 @@ mod tests {
     fn test_decode_recursive_tuple() {
         let two_decode = <(String, (String, i64))>::try_from(&[
             2, 111, 110, 101, 0, 5, 2, 116, 119, 111, 0, 21, 42, 0,
-        ]).expect("failed two");
+        ])
+        .expect("failed two");
 
         // TODO: can we get eq for borrows of the inner types?
         assert_eq!(("one".to_string(), ("two".to_string(), 42)), two_decode);
@@ -359,7 +439,8 @@ mod tests {
         let three_decode = <(String, (String, i64, (String, i64)))>::try_from(&[
             2, 111, 110, 101, 0, 5, 2, 116, 119, 111, 0, 21, 42, 5, 2, 116, 104, 114, 101, 101, 0,
             21, 33, 0, 0,
-        ]).expect("failed three");
+        ])
+        .expect("failed three");
 
         assert_eq!(
             &(
@@ -426,5 +507,38 @@ mod tests {
             (1_i64, (1_i64,), (1_i64,)),
             Decode::try_from(&[21, 1, 5, 21, 1, 0, 5, 21, 1, 0]).expect("(1, (1,), (1,))")
         );
+    }
+
+    #[test]
+    fn test_versionstamp_counts() {
+        let tuple = Tuple::from(vec![
+            Element::Versionstamp(Versionstamp::new_incomplete_versionstamp()),
+            Element::I64(1),
+            Element::I64(2),
+        ]);
+
+        assert_eq!(tuple.count_incomplete_versionstamps(0), 1);
+
+        let tuple = Tuple::from(vec![
+            Element::Versionstamp(Versionstamp::new_incomplete_versionstamp()),
+            Element::I64(1),
+            Element::I64(2),
+            Element::Versionstamp(Versionstamp::new_incomplete_versionstamp()),
+            Element::Versionstamp(Versionstamp::new_incomplete_versionstamp()),
+        ]);
+
+        assert_eq!(tuple.count_incomplete_versionstamps(0), 3);
+
+        let tuple = Tuple::from(vec![
+            Element::Versionstamp(Versionstamp::new_incomplete_versionstamp()),
+            Element::I64(1),
+            Element::I64(2),
+            Element::Tuple(Tuple::from(vec![Element::I64(3)])),
+            Element::Tuple(Tuple::from(vec![Element::Versionstamp(
+                Versionstamp::new_incomplete_versionstamp(),
+            )])),
+        ]);
+
+        assert_eq!(tuple.count_incomplete_versionstamps(0), 2);
     }
 }
